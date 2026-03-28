@@ -3,6 +3,7 @@
 #include "AiEsp32RotaryEncoder.h"
 #include <Wire.h>
 #include <radio.h>
+#include <RDA5807M.h>
 #include <RDSParser.h>
 #include <TFT_eSPI.h>
 #include "fonts.h"
@@ -27,7 +28,7 @@
 #define ENCODER_DT    32
 #define ENCODER_SW    13
 #define ENCODER_VCC   -1
-#define ENCODER_STEPS  4
+#define ENCODER_STEPS  2
 
 #define FM_FREQ_MIN  8750   // 87.5 MHz in 10kHz units
 #define FM_FREQ_MAX 10800   // 108.0 MHz
@@ -49,9 +50,8 @@
 #define LIST_ROW   26   // px per preset row
 #define LIST_N      5
 
-const int pwmFreq          = 5000;
-const int pwmResolution    = 8;
-const int pwmLedChannelTFT = 0;
+const int pwmFreq       = 5000;
+const int pwmResolution = 8;
 
 int  backlight[5] = {30, 50, 60, 120, 220};
 byte br = 1;
@@ -59,8 +59,7 @@ byte br = 1;
 TFT_eSPI tft = TFT_eSPI();
 RDA5807M radio;
 RDSParser rds;
-AiEsp32RotaryEncoder rotaryEncoder = AiEsp32RotaryEncoder(
-    ENCODER_CLK, ENCODER_DT, ENCODER_SW, ENCODER_VCC, ENCODER_STEPS);
+AiEsp32RotaryEncoder *rotaryEncoder = nullptr;
 
 String stations[LIST_N] = {"KOPB", "KMHD", "Jam'n", "KBOO", "KINK"};
 String freqs[LIST_N]    = {"91.5", "89.1", "107.5", "90.7", "102.9"};
@@ -85,7 +84,7 @@ BtnState btn1 = {}, btn2 = {}, encBtn = {};
 
 // ───── ISR ─────────────────────────────────────────────────────────────────
 
-void IRAM_ATTR readEncoderISR() { rotaryEncoder.readEncoder_ISR(); }
+void IRAM_ATTR readEncoderISR() { if (rotaryEncoder) rotaryEncoder->readEncoder_ISR(); }
 
 // ───── RDS ─────────────────────────────────────────────────────────────────
 
@@ -93,7 +92,7 @@ void RDS_process(uint16_t b1, uint16_t b2, uint16_t b3, uint16_t b4) {
   rds.processData(b1, b2, b3, b4);
 }
 
-void DisplayServiceName(char *name) {
+void DisplayServiceName(const char *name) {
   Serial.print("RDS:"); Serial.println(name);
   rdsText = String(name);
   rdsText.trim();
@@ -105,7 +104,7 @@ void DisplayServiceName(char *name) {
 void wakeFromSleep() {
   if (isAsleep) {
     isAsleep = false;
-    ledcWrite(pwmLedChannelTFT, backlight[br]);
+    ledcWrite(TFT_BL, backlight[br]);
   }
   lastInteractionTime = millis();
 }
@@ -229,9 +228,9 @@ void switchToPresetMode() {
   currentMode = MODE_PRESET;
   radio.setBandFrequency(FIX_BAND, freqs[chosen].toFloat() * 100);
   drawFullUI();
-  rotaryEncoder.setAcceleration(0);
-  rotaryEncoder.setBoundaries(0, LIST_N - 1, true);
-  rotaryEncoder.setEncoderValue(chosen);
+  rotaryEncoder->setAcceleration(0);
+  rotaryEncoder->setBoundaries(0, LIST_N - 1, true);
+  rotaryEncoder->setEncoderValue(chosen);
 }
 
 void switchToScanMode() {
@@ -239,9 +238,9 @@ void switchToScanMode() {
   scanFreq = (int)(freqs[chosen].toFloat() * 100);
   radio.setBandFrequency(FIX_BAND, scanFreq);
   drawFullUI();
-  rotaryEncoder.setAcceleration(150);
-  rotaryEncoder.setBoundaries(FM_FREQ_MIN, FM_FREQ_MAX, false);
-  rotaryEncoder.setEncoderValue(scanFreq);
+  rotaryEncoder->setAcceleration(50);
+  rotaryEncoder->setBoundaries(FM_FREQ_MIN, FM_FREQ_MAX, false);
+  rotaryEncoder->setEncoderValue(scanFreq);
 }
 
 void switchToVolumeMode() {
@@ -251,9 +250,9 @@ void switchToVolumeMode() {
   drawLargeFreqArea("VOL " + String(vol));
   drawVolBar(vol);
   drawModeRow();
-  rotaryEncoder.setAcceleration(0);
-  rotaryEncoder.setBoundaries(0, 15, false);
-  rotaryEncoder.setEncoderValue(vol);
+  rotaryEncoder->setAcceleration(0);
+  rotaryEncoder->setBoundaries(0, 15, false);
+  rotaryEncoder->setEncoderValue(vol);
 }
 
 void exitVolumeMode() {
@@ -275,7 +274,7 @@ void doSeekUp() {
   } while (!info.tuned && millis() - start < 4000);
   scanFreq = radio.getFrequency();
   drawLargeFreqArea(fmtFreq(scanFreq));
-  rotaryEncoder.setEncoderValue(scanFreq);
+  rotaryEncoder->setEncoderValue(scanFreq);
   rdsText = "";
   drawRdsRow();
   drawTopBar();  // refresh signal strength after landing
@@ -298,30 +297,57 @@ void setup() {
   pinMode(BUTTON_1, INPUT_PULLUP);
   pinMode(BUTTON_2, INPUT_PULLUP);
 
+  Serial.println("1: Wire");
   Wire.begin(26, 27);  // SDA=26, SCL=27 → radio board
+  delay(100);
 
-  radio.init();
-  radio.debugEnable();
-  radio.attachReceiveRDS(RDS_process);
-  rds.attachServicenNameCallback(DisplayServiceName);
-  radio.setBandFrequency(FIX_BAND, freqs[chosen].toFloat() * 100);
-  radio.setVolume(10);
-  radio.setMono(false);
+  // I2C scan — confirm radio board is visible before calling init()
+  Serial.println("1b: I2C scan");
+  bool radioFound = false;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      Serial.print("  found: 0x"); Serial.println(addr, HEX);
+      if (addr == 0x10 || addr == 0x11) radioFound = true;
+    }
+  }
+  if (!radioFound) Serial.println("  *** RDA5807M NOT FOUND — check Qwiic cable (SDA=26, SCL=27) ***");
 
+  Serial.println("2: radio.initWire + init");
+  radio.initWire(Wire);  // must call before init() — otherwise _i2cPort is null → crash
+  bool ok = radio.init();
+  Serial.print("3: radio.init returned "); Serial.println(ok ? "true" : "false");
+  if (ok) {
+    radio.debugEnable();
+    radio.attachReceiveRDS(RDS_process);
+    rds.attachServiceNameCallback(DisplayServiceName);
+    radio.setBandFrequency(FIX_BAND, freqs[chosen].toFloat() * 100);
+    radio.setVolume(10);
+    radio.setMono(false);
+  } else {
+    Serial.println("  *** radio.init() failed — continuing without radio ***");
+  }
+
+  Serial.println("4: tft.init");
   tft.init();
   tft.setSwapBytes(true);
 
-  ledcSetup(pwmLedChannelTFT, pwmFreq, pwmResolution);
-  ledcAttachPin(TFT_BL, pwmLedChannelTFT);
-  ledcWrite(pwmLedChannelTFT, backlight[br]);
+  Serial.println("5: backlight");
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  ledcAttach(TFT_BL, pwmFreq, pwmResolution);
+  ledcWrite(TFT_BL, backlight[br]);
 
+  Serial.println("6: drawFullUI");
   drawFullUI();
 
-  rotaryEncoder.begin();
-  rotaryEncoder.setup(readEncoderISR);
-  rotaryEncoder.setAcceleration(0);
-  rotaryEncoder.setBoundaries(0, LIST_N - 1, true);
-  rotaryEncoder.setEncoderValue(chosen);
+  rotaryEncoder = new AiEsp32RotaryEncoder(ENCODER_CLK, ENCODER_DT, ENCODER_SW, ENCODER_VCC, ENCODER_STEPS);
+  rotaryEncoder->begin();
+  rotaryEncoder->setup(readEncoderISR);
+  rotaryEncoder->setAcceleration(0);
+  rotaryEncoder->setBoundaries(0, LIST_N - 1, true);
+  rotaryEncoder->setEncoderValue(chosen);
 
   lastInteractionTime = millis();
 }
@@ -334,12 +360,12 @@ void loop() {
   // Idle sleep
   if (!isAsleep && now - lastInteractionTime > SLEEP_TIMEOUT_MS) {
     isAsleep = true;
-    ledcWrite(pwmLedChannelTFT, 0);
+    ledcWrite(TFT_BL, 0);
   }
 
   // ── Encoder button: short = toggle PRESET↔SCAN / exit VOLUME
   //                   long  = seek (SCAN mode only)
-  if (rotaryEncoder.isEncoderButtonDown()) {
+  if (rotaryEncoder->isEncoderButtonDown()) {
     if (!encBtn.down) {
       encBtn = {true, false, now};
       wakeFromSleep();
@@ -359,9 +385,9 @@ void loop() {
   }
 
   // ── Encoder rotation
-  if (rotaryEncoder.encoderChanged()) {
+  if (rotaryEncoder->encoderChanged()) {
     wakeFromSleep();
-    long val = rotaryEncoder.readEncoder();
+    long val = rotaryEncoder->readEncoder();
     if (currentMode == MODE_PRESET) {
       int prev = chosen;
       chosen = (int)val;
@@ -394,7 +420,7 @@ void loop() {
     if (!btn1.longHandled && now - btn1.pressStart >= LONG_PRESS_MS) {
       btn1.longHandled = true;
       isMuted = !isMuted;
-      radio.setMuted(isMuted);
+      radio.setMute(isMuted);
       drawTopBar();
     }
   } else if (btn1.down) {
@@ -423,7 +449,7 @@ void loop() {
     if (!btn2.longHandled) {
       wakeFromSleep();
       br = (br + 1) % 5;
-      ledcWrite(pwmLedChannelTFT, backlight[br]);
+      ledcWrite(TFT_BL, backlight[br]);
     }
   }
 
